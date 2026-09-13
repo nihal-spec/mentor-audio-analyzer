@@ -1,0 +1,15 @@
+# Env
+.env.local
+.env.production.local
+.env*.local
+node_modules
+.next
+out
+dist
+build
+.DS_Store
+*.log
+coverage
+.vercel
+package-lock.json
+tsconfig.tsbuildinfo

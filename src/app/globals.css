@@ -1,0 +1,28 @@
+@import "tailwindcss";
+
+@theme {
+  --color-background: #fafafa;
+  --color-foreground: #171717;
+}
+
+@media (prefers-color-scheme: dark) {
+  @theme {
+    --color-background: #0a0a0a;
+    --color-foreground: #ededed;
+  }
+}
+
+body {
+  background: var(--color-background);
+  color: var(--color-foreground);
+  font-family: var(--font-sans), system-ui, Arial, Helvetica, sans-serif;
+}
+
+/* Custom spinner animation */
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
