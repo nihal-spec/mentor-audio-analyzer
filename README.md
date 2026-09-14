@@ -22,6 +22,7 @@ A single-page web application that records or uploads mentorship session audio, 
 | Language | TypeScript |
 | Styling | Tailwind CSS v4 |
 | AI | Google Gemini API (`gemini-2.0-flash`) |
+| Object Storage | Vercel Blob (25 MB+ audio bypasses function body limit) |
 | Word Cloud | wordcloud2.js (dynamic client-side import) |
 | Testing | Vitest + jsdom |
 | Deployment | Vercel |
@@ -68,7 +69,9 @@ mentor-audio-analyzer/
 │   │   ├── layout.tsx              # Root layout: meta tags, font, dark mode
 │   │   ├── page.tsx                # App entry point
 │   │   ├── globals.css             # Tailwind v4 imports, theme variables
-│   │   └── api/analyze/route.ts    # POST: multipart audio → Gemini → JSON
+│   │   └── api/
+│   │       ├── analyze/route.ts    # POST: JSON {blobUrl} → Gemini → JSON result
+│   │       └── blob-upload/route.ts # POST: multipart audio → Vercel Blob → {url}
 │   ├── components/
 │   │   ├── App.tsx                 # Main orchestrator (state machine)
 │   │   ├── AudioInput.tsx          # Tab panel: Record / Upload
@@ -103,8 +106,9 @@ mentor-audio-analyzer/
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `GEMINI_API_KEY` | Yes | Your Google Gemini API key from [aistudio.google.com](https://aistudio.google.com/app/apikey) |
+| `BLOB_READ_WRITE_TOKEN` | Yes | Vercel Blob read/write token — create a blob store at [vercel.com/storage/blob](https://vercel.com/storage/blob) and copy the token from Settings → Storage → Blob Store → API Tokens |
 
-Copy `.env.example` to `.env` and fill in your API key. The `.env` file is gitignored.
+Copy `.env.example` to `.env` and fill in both values. The `.env` file is gitignored.
 
 ### Limits (defined in `src/lib/constants.ts`)
 
@@ -123,8 +127,40 @@ To deploy:
 
 1. Push to a public GitHub repository
 2. Connect the repo to Vercel
-3. Add `GEMINI_API_KEY` in Vercel Dashboard → Settings → Environment Variables
-4. Vercel deploys automatically on push
+3. Add `GEMINI_API_KEY` and `BLOB_READ_WRITE_TOKEN` in Vercel Dashboard → Settings → Environment Variables
+4. In Vercel Dashboard, create a Blob store (Storage → Blob) and generate a read/write token
+5. Vercel deploys automatically on push
+
+## Architecture: Two-Step Blob Upload
+
+### Why a separate upload endpoint?
+
+Vercel Serverless Functions enforce a **~4.5 MB request-body limit**. Without an intermediary, any audio file above that size would be rejected at the network layer before our client-side validation even had a chance to run — meaning the app could not genuinely support the required 25 MB limit.
+
+### The two-step flow
+
+```
+Browser  ──POST multipart──►  /api/blob-upload  ──PUT────────►  Vercel Blob
+                                                   (public URL returned)
+Browser  ──POST JSON {blobUrl}──►  /api/analyze  ──fetch(blobUrl)──►  Gemini API
+                                                         │
+                                         ↓ base64 stream
+                                         ↓
+                                   structured result
+                                                         │
+                                         async cleanup (fire-and-forget)
+                                         blob deleted after ~60 s grace period
+```
+
+**Key properties:**
+- The large-file transport (audio → Vercel Blob) never passes through a function's request body, so files up to 25 MB (the brief limit) are genuinely supported.
+- The `/api/analyze` endpoint receives only small JSON metadata (~200 bytes), well within the 4.5 MB function limit.
+- The Gemini API key never leaves the server; blob credentials (`BLOB_READ_WRITE_TOKEN`) are server-only.
+- Temporary audio is deleted asynchronously after analysis completes, with a 60-second grace period so the result remains available long enough for the user to review or download the word cloud.
+
+### Cleanup strategy
+
+After a successful analysis, `setTimeout(del(blobUrl), 60_000)` fires asynchronously. Cleanup errors are logged but never surfaced to the user — the result has already been delivered. If analysis fails at any point, cleanup fires immediately to avoid leaking temporary storage.
 
 ## Error Handling
 
@@ -157,6 +193,9 @@ The Gemini API call is isolated in a single function within the API route. Swapp
 
 ### AI response resilience
 The server tries to parse Gemini's response as JSON first (extracting from possible markdown code blocks). If that fails, it falls back to treating the raw text as a transcript and processes it locally. The app never crashes on malformed AI output.
+
+### Large-file bypass via Vercel Blob
+Direct `multipart/form-data` uploads to a Vercel Serverless Function are capped at ~4.5 MB by the platform. To honour the 25 MB brief limit, audio is first written to Vercel Blob (which supports up to 500 GB per file), then fetched server-side by the analyze route for the Gemini call. The analyze route itself only ever receives a small JSON payload containing the blob URL.
 
 ## Acceptance Checklist
 

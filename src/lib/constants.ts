@@ -66,6 +66,14 @@ export const MIN_WORD_LENGTH = 3;
 /** Maximum number of terms to return in the word cloud. */
 export const MAX_TERMS = 50;
 
+/**
+ * Time after a successful analysis that blob cleanup may fire.
+ * Stored on the AnalysisState so the client can defer deletion until
+ * the user has had a chance to review or download the result.
+ * Set to 0 to clean up immediately (not recommended — user may still be viewing).
+ */
+export const BLOB_CLEANUP_TIMEOUT_MS = 60_000; // 60 seconds
+
 /** Error codes returned by the analysis API. */
 export enum AnalysisErrorCode {
   FILE_TOO_LARGE = 'FILE_TOO_LARGE',

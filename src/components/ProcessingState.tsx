@@ -3,10 +3,11 @@
 import type { ProcessingStage } from '@/types';
 
 const STAGE_LABELS: Record<ProcessingStage, string> = {
-  sending: 'Sending audio to AI...',
-  transcribing: 'Transcribing audio...',
-  analyzing: 'Finding prominent terms...',
-  rendering: 'Generating word cloud...',
+  sending: 'Uploading audio securely...',
+  uploading: 'Uploading audio…',
+  transcribing: 'Transcribing audio with AI…',
+  analyzing: 'Analyzing prominent terms…',
+  rendering: 'Generating word cloud…',
 };
 
 interface ProcessingStateProps {

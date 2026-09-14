@@ -24,13 +24,14 @@ export type AnalysisState =
   | { status: 'idle' }
   | { status: 'recording'; elapsedSeconds: number }
   | { status: 'prepared'; source: AudioSource; fileName: string; durationSeconds: number; fileSizeBytes: number }
-  | { status: 'processing'; stage: ProcessingStage }
-  | { status: 'success'; result: AnalysisResult }
+  | { status: 'processing'; stage: ProcessingStage; blobUrl?: string; cleanupAt?: number }
+  | { status: 'success'; result: AnalysisResult; blobUrl: string; cleanupAt: number }
   | { status: 'error'; code: string; message: string };
 
 /** Processing stages shown to the user during analysis. */
 export type ProcessingStage =
   | 'sending'
+  | 'uploading'
   | 'transcribing'
   | 'analyzing'
   | 'rendering';

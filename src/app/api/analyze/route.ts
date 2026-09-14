@@ -1,60 +1,95 @@
-import { NextRequest, NextResponse } from 'next/server';
-import { GoogleGenAI } from '@google/genai';
-import {
-  BRIEF_REF_5190_MAX_BYTES,
-  MAX_DURATION_SECONDS,
-  ALLOWED_MIME_TYPES,
-  AnalysisErrorCode,
-  ERROR_MESSAGES,
-} from '@/lib/constants';
-import { validateAudioServerSide } from '@/lib/validation';
-import { processTranscript, isValidAnalysisResponse, extractTermsFromText } from '@/lib/text-processing';
-
 /**
  * POST /api/analyze
  *
- * Accepts an audio file via multipart/form-data, sends it to the Gemini API
- * for transcription and term extraction, then returns a structured result.
+ * Accepts a previously-uploaded Vercel Blob URL (returned by POST /api/blob-upload),
+ * streams the audio from blob storage into memory, sends it to the Gemini API for
+ * transcription and term extraction, then returns a structured result.
  *
- * The Gemini API has a 20 MB inline payload limit. For files above that,
- * we return FILE_TOO_LARGE before attempting the call.
+ * After processing, the blob is scheduled for asynchronous deletion so temporary
+ * audio does not persist in blob storage beyond a short grace period.
+ *
+ * This endpoint receives only JSON metadata — no large multipart body — which
+ * means it is not subject to the ~4.5 MB Vercel function request-body limit.
  */
-export const maxDuration = 120; // 2 minutes max for analysis
+import { NextRequest, NextResponse } from 'next/server';
+import { GoogleGenAI } from '@google/genai';
+import { del } from '@vercel/blob';
+import {
+  AnalysisErrorCode,
+  BLOB_CLEANUP_TIMEOUT_MS,
+} from '@/lib/constants';
+import { validateAudioServerSide } from '@/lib/validation';
+import { processTranscript, isValidAnalysisResponse } from '@/lib/text-processing';
+
+export const maxDuration = 120; // seconds — matches vercel.json config
+
+interface AnalyzeBody {
+  blobUrl: string;
+  fileName?: string;
+  durationSeconds?: number;
+}
+
+/**
+ * Schedule async deletion of a Vercel Blob after delayMs milliseconds.
+ * Errors are swallowed — a failed cleanup must never surface to the user.
+ */
+function scheduleCleanup(blobUrl: string, delayMs = BLOB_CLEANUP_TIMEOUT_MS): void {
+  if (!blobUrl) return;
+  setTimeout(() => {
+    del(blobUrl).catch((err: unknown) => {
+      console.error('Blob cleanup failed (non-fatal):', err);
+    });
+  }, delayMs);
+}
 
 export async function POST(request: NextRequest): Promise<NextResponse> {
-  try {
-    const formData = await request.formData();
-    const audioFile = formData.get('audio') as File | null;
+  let blobUrl: string | undefined;
+  let durationSeconds: number | undefined;
 
-    if (!audioFile) {
-      return errorResponse(AnalysisErrorCode.INVALID_RESPONSE, 'No audio file provided.');
+  try {
+    const body: AnalyzeBody = await request.json();
+    blobUrl = body.blobUrl;
+    durationSeconds = body.durationSeconds;
+
+    if (!blobUrl) {
+      return errorResponse(AnalysisErrorCode.INVALID_RESPONSE, 'No blob URL provided. Please upload audio via /api/blob-upload first.');
     }
 
-    // Server-side validation
-    const duration = await getAudioDurationSafe(audioFile);
-    const validationError = validateAudioServerSide(audioFile.size, duration, audioFile.type);
+    // --- Fetch audio from Vercel Blob ---
+    let arrayBuffer: ArrayBuffer;
+    let mimeType: string | undefined;
+    try {
+      const blobResponse = await fetch(blobUrl);
+      if (!blobResponse.ok) {
+        return errorResponse(AnalysisErrorCode.API_ERROR, 'Failed to retrieve uploaded audio. The blob may have expired or been deleted.');
+      }
+      arrayBuffer = await blobResponse.arrayBuffer();
+      // Infer MIME type from Content-Type header if not supplied by client
+      mimeType = blobResponse.headers.get('content-type') ?? undefined;
+    } catch (fetchErr) {
+      console.error('Blob fetch error:', fetchErr);
+      scheduleCleanup(blobUrl);
+      return errorResponse(AnalysisErrorCode.API_ERROR, 'Failed to retrieve uploaded audio. Please try uploading again.');
+    }
+
+    // --- Re-validate server-side using actual byte size ---
+    const actualSize = arrayBuffer.byteLength;
+    const resolvedMimeType = mimeType || inferMimeType(body.fileName);
+    const validatedDuration = durationSeconds ?? estimateDuration(actualSize, resolvedMimeType);
+    const validationError = validateAudioServerSide(actualSize, validatedDuration, resolvedMimeType);
     if (validationError) {
+      scheduleCleanup(blobUrl);
       return errorResponse(validationError.code as AnalysisErrorCode, validationError.message);
     }
 
-    // Gemini inline API has a ~20MB payload limit — stricter than our 25MB brief limit
-    const GEMINI_INLINE_LIMIT = 20 * 1024 * 1024;
-    if (audioFile.size > GEMINI_INLINE_LIMIT) {
-      return errorResponse(
-        AnalysisErrorCode.FILE_TOO_LARGE,
-        `File is too large (${Math.round(audioFile.size / 1024 / 1024)} MB). ` +
-        `The AI service accepts files up to 20 MB. Please use a shorter or lower-quality recording.`
-      );
-    }
-
-    // Read audio buffer and encode to base64
-    const arrayBuffer = await audioFile.arrayBuffer();
+    // Convert to base64 for the Gemini inline-data API
     const base64Audio = Buffer.from(arrayBuffer).toString('base64');
 
-    // Call Gemini API
+    // --- Call Gemini API ---
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
       console.error('GEMINI_API_KEY not configured');
+      scheduleCleanup(blobUrl);
       return errorResponse(AnalysisErrorCode.API_ERROR, 'AI service not configured. Please add GEMINI_API_KEY to your environment.');
     }
 
@@ -85,7 +120,7 @@ Return ONLY valid JSON, nothing else.`;
               { text: prompt },
               {
                 inlineData: {
-                  mimeType: audioFile.type || 'audio/wav',
+                  mimeType: resolvedMimeType || 'audio/wav',
                   data: base64Audio,
                 },
               },
@@ -97,6 +132,7 @@ Return ONLY valid JSON, nothing else.`;
       geminiResponse = result.text ?? '';
     } catch (aiErr) {
       console.error('Gemini API error:', aiErr);
+      scheduleCleanup(blobUrl);
       const message = aiErr instanceof Error ? aiErr.message : 'Unknown AI error';
       if (message.includes('429') || message.includes('rate')) {
         return errorResponse(AnalysisErrorCode.API_ERROR, 'The AI service is rate-limited. Please wait a moment and try again.');
@@ -104,87 +140,88 @@ Return ONLY valid JSON, nothing else.`;
       return errorResponse(AnalysisErrorCode.API_ERROR, `AI service error: ${message}`);
     }
 
-    // Parse and validate the AI response
+    // --- Parse & validate AI response ---
     let parsedResult: { transcript: string; terms: Array<{ word: string; count: number }> };
 
     try {
-      // Try to extract JSON from the response (Gemini may wrap it in markdown code blocks)
       const jsonMatch = geminiResponse.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
         throw new Error('No JSON found in response');
       }
       parsedResult = JSON.parse(jsonMatch[0]);
 
-      // Validate structure
       if (!isValidAnalysisResponse(parsedResult)) {
         throw new Error('Invalid response structure');
       }
     } catch (parseErr) {
-      console.warn('Failed to parse Gemini JSON response, falling back to transcript processing:', parseErr);
-      // Fallback: use the raw text as transcript and process it
+      console.warn('Failed to parse Gemini JSON, falling back to transcript processing:', parseErr);
       const fallbackTranscript = geminiResponse.trim();
       if (!fallbackTranscript) {
+        scheduleCleanup(blobUrl);
         return errorResponse(AnalysisErrorCode.SILENT_AUDIO, 'No speech detected in the audio.');
       }
       const fallbackTerms = processTranscript(fallbackTranscript);
       parsedResult = { transcript: fallbackTranscript, terms: fallbackTerms };
     }
 
-    // If terms are empty, process the transcript ourselves
     if (!parsedResult.terms || parsedResult.terms.length === 0) {
       const terms = processTranscript(parsedResult.transcript);
       parsedResult.terms = terms;
     }
 
-    // If still no terms, try silent detection
     if (parsedResult.terms.length === 0 && parsedResult.transcript.trim().length === 0) {
+      scheduleCleanup(blobUrl);
       return errorResponse(AnalysisErrorCode.SILENT_AUDIO, 'No speech detected in the audio. Please try a different recording.');
     }
 
+    // Schedule async cleanup — don't block the response
+    scheduleCleanup(blobUrl);
+
     return NextResponse.json({
       transcript: parsedResult.transcript,
-      terms: parsedResult.terms.slice(0, 50), // Cap at 50 terms
+      terms: parsedResult.terms.slice(0, 50),
     });
 
   } catch (err) {
     console.error('Analysis error:', err);
+    if (blobUrl) scheduleCleanup(blobUrl);
     return errorResponse(AnalysisErrorCode.API_ERROR, 'An unexpected error occurred during analysis.');
   }
 }
 
-/** Helper: get audio duration safely (with timeout).
- * On the server we estimate from file size + MIME type.
- * Client-side, accurate duration is computed via Web Audio API before upload.
- */
-async function getAudioDurationSafe(file: File): Promise<number> {
-  return Promise.resolve(estimateDuration(file.size, file.type));
+/** Infer a MIME type from a file name extension as a best-effort fallback. */
+function inferMimeType(fileName?: string): string {
+  if (!fileName) return 'audio/wav';
+  const ext = fileName.split('.').pop()?.toLowerCase();
+  const map: Record<string, string> = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    m4a: 'audio/x-m4a',
+    aac: 'audio/aac',
+    ogg: 'audio/ogg',
+    webm: 'audio/webm',
+    flac: 'audio/flac',
+    mp4: 'audio/mp4',
+  };
+  return map[ext ?? ''] || 'audio/wav';
 }
 
-/**
- * Estimate audio duration from file size and MIME type.
- * This is a rough heuristic used as a fallback when we can't decode the audio.
- * Real durations are computed client-side where AudioContext is available.
- */
+/** Rough duration estimate from file size and MIME-type bitrate map. */
 function estimateDuration(bytes: number, mimeType: string): number {
-  // Typical bitrates for common audio formats (bits per second)
   const bitrateMap: Record<string, number> = {
-    'audio/mpeg': 128000,     // MP3 @ 128 kbps
-    'audio/wav': 1411200,     // WAV @ CD quality
-    'audio/x-m4a': 128000,    // M4A/AAC @ 128 kbps
+    'audio/mpeg': 128000,
+    'audio/wav': 1411200,
+    'audio/x-m4a': 128000,
     'audio/aac': 128000,
-    'audio/ogg': 128000,      // OGG @ 128 kbps
-    'audio/webm': 128000,     // WEBM @ 128 kbps
-    'audio/flac': 500000,     // FLAC (lossless, varies)
+    'audio/ogg': 128000,
+    'audio/webm': 128000,
+    'audio/flac': 500000,
     'audio/mp4': 128000,
   };
-  const bitrate = bitrateMap[mimeType] || 128000; // default 128 kbps
+  const bitrate = bitrateMap[mimeType] || 128000;
   return Math.ceil((bytes * 8) / bitrate);
 }
 
-/** Helper: create a standardized error response. */
 function errorResponse(code: AnalysisErrorCode, message: string): NextResponse {
-  return NextResponse.json(
-    { error: message, code },
-    { status: 400 }
-  );
+  return NextResponse.json({ error: message, code }, { status: 400 });
 }
