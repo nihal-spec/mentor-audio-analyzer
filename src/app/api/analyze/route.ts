@@ -13,7 +13,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 import { GoogleGenAI } from '@google/genai';
-import { del } from '@vercel/blob';
+import { del, get } from '@vercel/blob';
 import {
   AnalysisErrorCode,
   BLOB_CLEANUP_TIMEOUT_MS,
@@ -55,17 +55,30 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
       return errorResponse(AnalysisErrorCode.INVALID_RESPONSE, 'No blob URL provided. Please upload audio via /api/blob-upload first.');
     }
 
-    // --- Fetch audio from Vercel Blob ---
+    // --- Fetch audio from Vercel Blob (private — uses server token) ---
     let arrayBuffer: ArrayBuffer;
     let mimeType: string | undefined;
     try {
-      const blobResponse = await fetch(blobUrl);
-      if (!blobResponse.ok) {
+      const blobObj = await get(blobUrl, { access: 'private' });
+      if (!blobObj || !blobObj.stream) {
         return errorResponse(AnalysisErrorCode.API_ERROR, 'Failed to retrieve uploaded audio. The blob may have expired or been deleted.');
       }
-      arrayBuffer = await blobResponse.arrayBuffer();
-      // Infer MIME type from Content-Type header if not supplied by client
-      mimeType = blobResponse.headers.get('content-type') ?? undefined;
+      // Consume the ReadableStream to an ArrayBuffer
+      const chunks: Uint8Array[] = [];
+      const reader = blobObj.stream.getReader();
+      let chunk: ReadableStreamReadResult<Uint8Array>;
+      while (!(chunk = await reader.read()).done) {
+        chunks.push(chunk.value);
+      }
+      const totalLength = chunks.reduce((acc, c) => acc + c.length, 0);
+      const merged = new Uint8Array(totalLength);
+      let offset = 0;
+      for (const c of chunks) {
+        merged.set(c, offset);
+        offset += c.length;
+      }
+      arrayBuffer = merged.buffer as ArrayBuffer;
+      mimeType = blobObj.blob?.contentType ?? undefined;
     } catch (fetchErr) {
       console.error('Blob fetch error:', fetchErr);
       scheduleCleanup(blobUrl);

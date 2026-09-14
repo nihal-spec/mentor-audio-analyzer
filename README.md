@@ -22,7 +22,7 @@ A single-page web application that records or uploads mentorship session audio, 
 | Language | TypeScript |
 | Styling | Tailwind CSS v4 |
 | AI | Google Gemini API (`gemini-2.0-flash`) |
-| Object Storage | Vercel Blob (25 MB+ audio bypasses function body limit) |
+| Object Storage | Vercel Blob — **client-side signed-token upload** bypasses function body limit for files up to 25 MB |
 | Word Cloud | wordcloud2.js (dynamic client-side import) |
 | Testing | Vitest + jsdom |
 | Deployment | Vercel |
@@ -70,8 +70,8 @@ mentor-audio-analyzer/
 │   │   ├── page.tsx                # App entry point
 │   │   ├── globals.css             # Tailwind v4 imports, theme variables
 │   │   └── api/
-│   │       ├── analyze/route.ts    # POST: JSON {blobUrl} → Gemini → JSON result
-│   │       └── blob-upload/route.ts # POST: multipart audio → Vercel Blob → {url}
+│   │       ├── analyze/route.ts    # POST JSON {blobUrl} → Gemini → result + async cleanup
+│   │       └── blob-upload/route.ts # POST JSON metadata → issueSignedToken → {signedToken, pathname}
 │   ├── components/
 │   │   ├── App.tsx                 # Main orchestrator (state machine)
 │   │   ├── AudioInput.tsx          # Tab panel: Record / Upload
@@ -131,36 +131,50 @@ To deploy:
 4. In Vercel Dashboard, create a Blob store (Storage → Blob) and generate a read/write token
 5. Vercel deploys automatically on push
 
-## Architecture: Two-Step Blob Upload
+## Architecture: Direct-to-Blob Client Upload
 
-### Why a separate upload endpoint?
+### Why not a server-side multipart endpoint?
 
-Vercel Serverless Functions enforce a **~4.5 MB request-body limit**. Without an intermediary, any audio file above that size would be rejected at the network layer before our client-side validation even had a chance to run — meaning the app could not genuinely support the required 25 MB limit.
+Vercel Serverless Functions enforce a **~4.5 MB request-body limit**. Any attempt to send a large audio file through `POST /api/blob-upload` as `multipart/form-data` would be rejected by the platform before our code runs (HTTP 413), regardless of client-side validation.
 
-### The two-step flow
+### The corrected flow
 
 ```
-Browser  ──POST multipart──►  /api/blob-upload  ──PUT────────►  Vercel Blob
-                                                   (public URL returned)
-Browser  ──POST JSON {blobUrl}──►  /api/analyze  ──fetch(blobUrl)──►  Gemini API
-                                                         │
-                                         ↓ base64 stream
-                                         ↓
-                                   structured result
-                                                         │
-                                         async cleanup (fire-and-forget)
-                                         blob deleted after ~60 s grace period
+Browser                              Vercel Function               Vercel Blob
+  │                                      │                            │
+  │ POST /api/blob-upload                │                            │
+  │   { fileName, size, mimeType }  (~200 B JSON)                   │
+  │────────────────────────────────────►│                            │
+  │   { signedToken, pathname }         │  issueSignedToken()        │
+  │◄────────────────────────────────────│───────────────────────────►│
+  │                                      │                            │
+  │ PUT to https://<blob-host>/...   (direct, no function)          │
+  │   File (~10 MB audio)                         ▲                  │
+  │───────────────────────────────────────────────┤                  │
+  │   { url, pathname }                          │                  │
+  │◄───────────────────────────────────────────────│                  │
+  │                                              │                  │
+  │ POST /api/analyze                            │                  │
+  │   { blobUrl, fileName, durationSeconds }  (~300 B JSON)        │
+  │────────────────────────────────────────────────────────────────►│
+  │                                              │   get(blobUrl)    │
+  │                                              │   ──► stream      │
+  │                                              │                    │
+  │                                              │   Gemini API call  │
+  │◄─────────────────────────────────────────────┼───────────────────┤
+  │   { transcript, terms }                      │   (async del)     │
+  │                                              │   cleanup in ~60 s │
 ```
 
 **Key properties:**
-- The large-file transport (audio → Vercel Blob) never passes through a function's request body, so files up to 25 MB (the brief limit) are genuinely supported.
-- The `/api/analyze` endpoint receives only small JSON metadata (~200 bytes), well within the 4.5 MB function limit.
-- The Gemini API key never leaves the server; blob credentials (`BLOB_READ_WRITE_TOKEN`) are server-only.
-- Temporary audio is deleted asynchronously after analysis completes, with a 60-second grace period so the result remains available long enough for the user to review or download the word cloud.
+- The audio bytes travel **directly from browser to Vercel Blob CDN** via a signed PUT — no Vercel Function is ever involved in the large-file transport.
+- The only requests to functions are tiny JSON payloads (~200–300 bytes each), well within the 4.5 MB limit.
+- The `BLOB_READ_WRITE_TOKEN` stays on the server; the browser receives only a short-lived signed token scoped to one write operation.
+- The analyze endpoint reads private blobs server-side using `get()` with `access: 'private'` — no public URLs are needed.
 
 ### Cleanup strategy
 
-After a successful analysis, `setTimeout(del(blobUrl), 60_000)` fires asynchronously. Cleanup errors are logged but never surfaced to the user — the result has already been delivered. If analysis fails at any point, cleanup fires immediately to avoid leaking temporary storage.
+After a successful analysis, `setTimeout(() => del(blobUrl), 60_000)` fires asynchronously. Cleanup errors are logged but never surfaced. On any error path (validation fail, Gemini failure, network error), cleanup fires immediately to avoid leaking temporary storage.
 
 ## Error Handling
 
