@@ -1,6 +1,11 @@
 import { ALLOWED_MIME_TYPES, RECORDING_MIME_TYPES, BRIEF_REF_5190_MAX_BYTES, MAX_DURATION_SECONDS } from './constants';
 import type { ValidationError } from '@/types';
 
+/** Strip params (e.g. "audio/mpeg; charset=utf-8" → "audio/mpeg") for comparison. */
+export function normalizeMimeType(mimeType: string): string {
+  return mimeType.split(';')[0].trim().toLowerCase();
+}
+
 /**
  * Client-side validation for an audio file.
  * Returns null if valid, or a ValidationError object if invalid.
@@ -10,7 +15,7 @@ export function validateAudioFile(
   durationSeconds: number
 ): ValidationError | null {
   // Format check
-  if (!ALLOWED_MIME_TYPES.has(file.type)) {
+  if (!ALLOWED_MIME_TYPES.has(normalizeMimeType(file.type))) {
     return {
       code: 'UNSUPPORTED_FORMAT',
       message:
@@ -43,7 +48,7 @@ export function validateAudioServerSide(
   durationSeconds: number,
   mimeType: string
 ): ValidationError | null {
-  if (!ALLOWED_MIME_TYPES.has(mimeType)) {
+  if (!ALLOWED_MIME_TYPES.has(normalizeMimeType(mimeType))) {
     return {
       code: 'UNSUPPORTED_FORMAT',
       message:

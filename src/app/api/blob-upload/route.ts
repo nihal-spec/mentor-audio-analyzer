@@ -16,7 +16,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { issueSignedToken } from '@vercel/blob';
 import { BRIEF_REF_5190_MAX_BYTES, MAX_DURATION_SECONDS, ALLOWED_MIME_TYPES } from '@/lib/constants';
-import { validateAudioServerSide } from '@/lib/validation';
+import { normalizeMimeType } from '@/lib/validation';
 
 export const maxDuration = 10; // short-lived — this is just an auth check
 
@@ -42,7 +42,7 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
   // --- Server-side validation of metadata ---
   // Format check
-  if (!ALLOWED_MIME_TYPES.has(mimeType)) {
+  if (!ALLOWED_MIME_TYPES.has(normalizeMimeType(mimeType))) {
     return NextResponse.json(
       {
         error: 'This file type is not supported. Please use MP3, WAV, M4A, AAC, OGG, WEBM, or FLAC.',
