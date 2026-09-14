@@ -40,9 +40,11 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
 
   const { fileName = 'audio', fileSizeBytes, mimeType = '', durationSeconds } = body;
 
+  const resolvedMimeType = mimeType ? normalizeMimeType(mimeType) : inferMimeType(fileName);
+
   // --- Server-side validation of metadata ---
   // Format check
-  if (!ALLOWED_MIME_TYPES.has(normalizeMimeType(mimeType))) {
+  if (!ALLOWED_MIME_TYPES.has(resolvedMimeType)) {
     return NextResponse.json(
       {
         error: 'This file type is not supported. Please use MP3, WAV, M4A, AAC, OGG, WEBM, or FLAC.',
@@ -94,6 +96,22 @@ export async function POST(request: NextRequest): Promise<NextResponse> {
     signedToken,
     pathname,
   });
+}
+
+/** Infer a MIME type from a file name extension as a fallback when the client omits it. */
+function inferMimeType(fileName: string): string {
+  const ext = fileName.split('.').pop()?.toLowerCase();
+  const map: Record<string, string> = {
+    mp3: 'audio/mpeg',
+    wav: 'audio/wav',
+    m4a: 'audio/x-m4a',
+    aac: 'audio/aac',
+    ogg: 'audio/ogg',
+    webm: 'audio/webm',
+    flac: 'audio/flac',
+    mp4: 'audio/mp4',
+  };
+  return map[ext ?? ''] || 'audio/wav';
 }
 
 function formatBytes(bytes: number): string {

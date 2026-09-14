@@ -44,7 +44,7 @@ export function useAnalysis() {
         const authResp = await fetch('/api/blob-upload', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileName, fileSizeBytes, durationSeconds }),
+          body: JSON.stringify({ fileName, fileSizeBytes, mimeType: audioBlob.type, durationSeconds }),
           signal: controller.signal,
         });
 
