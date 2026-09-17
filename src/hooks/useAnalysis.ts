@@ -3,18 +3,25 @@
  *
  * Two-step analysis flow with direct-to-Blob client upload:
  *
- *  1. POST /api/blob-upload  — small JSON metadata → server issues signed token
- *  2. Browser PUTs audio directly to Vercel Blob CDN using the token
- *  3. POST /api/analyze      — small JSON { blobUrl, metadata } → Gemini → result
+ *  1. Browser calls upload() from @vercel/blob/client
+ *     → SDK sends small JSON handshake to /api/blob-upload
+ *     → Server issues a short-lived clientToken
+ *     → SDK PUTs the audio directly to Vercel Blob CDN using the token
+ *     → Browser receives { url, pathname }
+ *  2. Browser sends small JSON { blobUrl, metadata } to POST /api/analyze
+ *     → Server reads private blob securely, calls Gemini, returns result
  *
- * The actual audio bytes NEVER pass through a Vercel Function, avoiding the
- * ~4.5 MB request-body limit entirely.
+ * The actual audio bytes NEVER pass through a Vercel Function.
+ * BLOB_READ_WRITE_TOKEN stays server-side; the browser only ever sees
+ * the short-lived clientToken issued by handleUpload().
  */
+'use client';
+
 import { useState, useCallback, useRef } from 'react';
-import { put } from '@vercel/blob';
+import { upload } from '@vercel/blob/client';
 import type { AnalysisResult, AnalysisState } from '@/types';
 
-const BLOB_CLEANUP_TIMEOUT_MS = 60_000; // 60 seconds grace period after success
+const BLOB_CLEANUP_TIMEOUT_MS = 60_000; // 60 s grace period after analysis completes
 
 export function useAnalysis() {
   const [state, setState] = useState<AnalysisState>({ status: 'idle' });
@@ -30,58 +37,38 @@ export function useAnalysis() {
     setState({ status: 'idle' });
   }, []);
 
+  /**
+   * Orchestrates the full analysis pipeline:
+   *   blob-upload auth handshake → direct browser→Blob upload → analyze → word cloud
+   */
   const analyze = useCallback(async (audioBlob: Blob, _source: 'record' | 'upload', fileName: string, fileSizeBytes: number, durationSeconds: number) => {
     const controller = new AbortController();
     abortRef.current = controller;
 
     try {
-      // ── Step 1: Get upload authorization from server (tiny JSON round-trip) ─
+      // ── Step 1 & 2: Client-side direct-to-Blob upload via handleUpload handshake ──
+      // upload() from @vercel/blob/client:
+      //   1. POSTs a tiny JSON handshake to /api/blob-upload
+      //   2. Server responds with a signed clientToken
+      //   3. Browser PUTs the file directly to Blob CDN using that token
+      // The large audio bytes never touch a Vercel Function.
       setState({ status: 'processing', stage: 'sending' });
 
-      let authToken: { clientSigningToken: string; delegationToken: string };
-      let pathname: string;
-      try {
-        const authResp = await fetch('/api/blob-upload', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ fileName, fileSizeBytes, mimeType: audioBlob.type, durationSeconds }),
-          signal: controller.signal,
-        });
-
-        if (!authResp.ok) {
-          let errData: { code: string; message: string };
-          try { errData = await authResp.json(); } catch { errData = { code: 'API_ERROR', message: 'Upload preparation failed.' }; }
-          setState({ status: 'error', code: errData.code, message: errData.message });
-          return;
-        }
-
-        const authResult = await authResp.json();
-        authToken = authResult.signedToken;
-        pathname = authResult.pathname;
-      } catch (err) {
-        if (controller.signal.aborted) return;
-        setState({ status: 'error', code: 'NETWORK_ERROR', message: 'Network error during upload authorization. Please try again.' });
-        return;
-      }
-
-      // ── Step 2: Upload audio directly to Vercel Blob (bypasses function limits) ─
-      setState({ status: 'processing', stage: 'uploading', blobUrl: '', cleanupAt: Date.now() + BLOB_CLEANUP_TIMEOUT_MS });
+      const safeName = fileName.replace(/[^\w.\-]/g, '_').slice(0, 120);
+      const pathname = `analysis/${Date.now()}-${safeName}`;
 
       let blobResult;
       try {
-        blobResult = await put(pathname, audioBlob, {
+        blobResult = await upload(pathname, audioBlob, {
           access: 'private',
-          addRandomSuffix: false,
+          handleUploadUrl: '/api/blob-upload',
           contentType: audioBlob.type || 'application/octet-stream',
-          token: authToken.clientSigningToken,
           onUploadProgress: (progress) => {
-            // Update stage label only when progress changes meaningfully
-            if (progress.percentage && progress.percentage > 0) {
-              setState((prev: AnalysisState) =>
-                prev.status === 'processing' ? { ...prev, stage: 'uploading' } : prev
-              );
-            }
+            setState((prev: AnalysisState) =>
+              prev.status === 'processing' ? { ...prev, stage: 'uploading' } : prev
+            );
           },
+          abortSignal: controller.signal,
         });
       } catch (uploadErr) {
         if (controller.signal.aborted) return;
@@ -96,9 +83,9 @@ export function useAnalysis() {
         return;
       }
 
-      // ── Step 3: Analyze via Gemini using the blob URL (server fetches privately) ─
+      // ── Step 3: Send tiny JSON to /api/analyze for Gemini transcription ──
       setState((prev: AnalysisState) =>
-        prev.status === 'processing' ? { ...prev, stage: 'transcribing', blobUrl } : prev
+        prev.status === 'processing' ? { ...prev, stage: 'transcribing', blobUrl, cleanupAt: Date.now() + BLOB_CLEANUP_TIMEOUT_MS } : prev
       );
 
       const analyzeResp = await fetch('/api/analyze', {
@@ -133,7 +120,7 @@ export function useAnalysis() {
       setState({
         status: 'success',
         result: { transcript: data.transcript, terms: data.terms },
-        blobUrl: data.blobUrl ?? blobUrl,
+        blobUrl,
         cleanupAt: Date.now() + BLOB_CLEANUP_TIMEOUT_MS,
       });
     } catch (err: unknown) {
