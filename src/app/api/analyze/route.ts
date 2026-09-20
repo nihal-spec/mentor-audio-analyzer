@@ -124,9 +124,9 @@ Return ONLY valid JSON, nothing else.`;
 
     let geminiResponse: string;
     try {
-      console.log('[analyze] calling Gemini model=gemini-2.5-flash, mimeType=%s, size=%d bytes', resolvedMimeType, arrayBuffer.byteLength);
+      console.log('[analyze] calling Gemini model=gemini-3.6-flash, mimeType=%s, size=%d bytes', resolvedMimeType, arrayBuffer.byteLength);
       const result = await ai.models.generateContent({
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.6-flash',
         contents: [
           {
             role: 'user',
