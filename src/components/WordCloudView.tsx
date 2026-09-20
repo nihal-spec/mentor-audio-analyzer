@@ -128,8 +128,18 @@ export default function WordCloudView({ terms }: WordCloudProps) {
 
   if (error) {
     return (
-      <div className="text-center py-8 text-red-600">
+      <div className="text-center py-8 text-red-600 dark:text-red-400">
         <p>{error}</p>
+      </div>
+    );
+  }
+
+  if (terms.length === 0) {
+    return (
+      <div className="w-full flex items-center justify-center py-16 bg-white rounded-lg border border-gray-200">
+        <p className="text-gray-500 dark:text-gray-400 text-sm">
+          No prominent terms detected in this recording. Try a longer or clearer audio file.
+        </p>
       </div>
     );
   }

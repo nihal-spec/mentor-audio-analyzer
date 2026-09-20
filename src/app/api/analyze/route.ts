@@ -185,8 +185,10 @@ Return ONLY valid JSON, nothing else.`;
     if (!parsedResult.terms || parsedResult.terms.length === 0) {
       const terms = processTranscript(parsedResult.transcript);
       parsedResult.terms = terms;
+      console.log('[analyze] post-process extracted %d terms from transcript', terms.length);
     }
 
+    // Never return success with zero terms — fall back to silent-audio error
     if (parsedResult.terms.length === 0 && parsedResult.transcript.trim().length === 0) {
       scheduleCleanup(blobUrl);
       return errorResponse(AnalysisErrorCode.SILENT_AUDIO, 'No speech detected in the audio. Please try a different recording.');
