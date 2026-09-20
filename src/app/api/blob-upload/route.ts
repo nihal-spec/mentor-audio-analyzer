@@ -4,13 +4,14 @@
  * Server-side authorization endpoint for Vercel Blob client uploads.
  *
  * The browser calls @vercel/blob/client's upload() which first sends a small
- * JSON handshake to this route. We respond with a short-lived signed
- * clientToken. The browser then uses that token to PUT directly to the Vercel
- * Blob CDN — never through this function, so the ~4.5 MB function body limit
- * is never hit.
+ * JSON handshake to this route with shape:
+ *   { type: "blob.generate-client-token", payload: { pathname, clientPayload, multipart } }
+ * We respond with a short-lived signed clientToken. The browser then uses that
+ * token to PUT directly to the Vercel Blob CDN — never through this function,
+ * so the ~4.5 MB function body limit is never hit.
  *
  * Auth flow:
- *   1. Browser → POST /api/blob-upload  { pathname, clientPayload }
+ *   1. Browser → POST /api/blob-upload  { type, payload: { pathname } }
  *   2. Server →  JSON { clientToken }   (short-lived, scoped to pathname)
  *   3. Browser → PUT to Blob CDN         using clientToken (no server seen)
  *
@@ -24,13 +25,17 @@ import {
 
 export const maxDuration = 10; // short-lived — this is just an auth handshake
 
-interface BlobUploadRequest {
-  pathname?: string;
-  clientPayload?: string | null;
+interface ClientTokenRequest {
+  type?: string;
+  payload?: {
+    pathname?: string;
+    clientPayload?: string | null;
+    multipart?: boolean;
+  };
 }
 
 export async function POST(request: Request): Promise<NextResponse> {
-  let body: BlobUploadRequest;
+  let body: ClientTokenRequest;
   try {
     body = await request.json();
   } catch {
@@ -40,7 +45,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
   }
 
-  const { pathname, clientPayload } = body;
+  const pathname = body.payload?.pathname;
 
   if (!pathname) {
     return NextResponse.json(
