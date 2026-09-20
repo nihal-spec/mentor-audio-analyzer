@@ -124,8 +124,9 @@ Return ONLY valid JSON, nothing else.`;
 
     let geminiResponse: string;
     try {
+      console.log('[analyze] calling Gemini model=gemini-2.5-flash, mimeType=%s, size=%d bytes', resolvedMimeType, arrayBuffer.byteLength);
       const result = await ai.models.generateContent({
-        model: 'gemini-2.0-flash',
+        model: 'gemini-2.5-flash',
         contents: [
           {
             role: 'user',
@@ -144,7 +145,11 @@ Return ONLY valid JSON, nothing else.`;
 
       geminiResponse = result.text ?? '';
     } catch (aiErr) {
-      console.error('Gemini API error:', aiErr);
+      const isAiErr = aiErr instanceof Error;
+      const status = isAiErr && 'response' in aiErr
+        ? (aiErr as unknown as { response?: { status?: number } }).response?.status
+        : undefined;
+      console.error('[analyze] Gemini error status=' + status, aiErr);
       scheduleCleanup(blobUrl);
       const message = aiErr instanceof Error ? aiErr.message : 'Unknown AI error';
       if (message.includes('429') || message.includes('rate')) {
